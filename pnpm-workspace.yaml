@@ -1,6 +1,5 @@
 packages:
   - 'packages/*'
-  - 'app/*'
 nodeLinker: isolated
 allowBuilds:
   '@parcel/watcher': false
