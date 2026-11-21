@@ -1,6 +1,11 @@
 import { injectable } from 'inversify'
 import { tryCatchSync } from '@/common/utils/tryCatch'
 import { waitForBody } from '@/content/common/host/waitForBody'
+import { queryAllDeep } from '@/content/common/shadowDom/deepQuery'
+import { SHADOW_ROOT_ATTACHED_EVENT } from '@/content/common/shadowDom/shadowRootAttachedEvent'
+import { shadowRootOf } from '@/content/common/shadowDom/shadowRootOf'
+import { CONTROLLER_ROOT_ID } from '@/content/controller/common/constants/rootId'
+import { PLAYER_ROOT_ID } from '@/content/player/constants/rootId'
 import { VideoSrcObserver } from './VideoSrcObserver'
 import { VideoStack } from './VideoStack'
 
@@ -12,6 +17,12 @@ const isVideoElement = (node: Node): node is HTMLVideoElement => {
 
 const isElement = (node: Node): node is Element => {
   return node.nodeType === Node.ELEMENT_NODE
+}
+
+// The extension's own UI roots are open in e2e builds and hold no page video,
+// but their shadow trees change on every rendered comment.
+function isExtensionRoot(host: Element): boolean {
+  return host.id === PLAYER_ROOT_ID || host.id === CONTROLLER_ROOT_ID
 }
 
 export type VideoChangeListener = (video: HTMLVideoElement) => void
@@ -40,6 +51,8 @@ export class VideoNodeObserverService {
   private lastChangeTime = new WeakMap<HTMLVideoElement, number>()
 
   private rootObs: MutationObserver
+  private observedShadowRoots = new WeakSet<ShadowRoot>()
+  private shadowListeners = new AbortController()
   private srcObs = new VideoSrcObserver()
   private selector = 'video'
 
@@ -52,12 +65,8 @@ export class VideoNodeObserverService {
     this.rootObs = new MutationObserver((mutations) => {
       for (const mutation of mutations) {
         for (const node of mutation.addedNodes) {
-          if (isVideoElement(node) && node.matches(this.selector)) {
-            this.handleAdded(node)
-          } else if (isElement(node)) {
-            node
-              .querySelectorAll<HTMLVideoElement>(this.selector)
-              .forEach((v) => this.handleAdded(v))
+          if (isElement(node)) {
+            this.scan(node)
           }
         }
 
@@ -93,13 +102,6 @@ export class VideoNodeObserverService {
     this.eventListeners.get(event)!.add(listener)
   }
 
-  removeEventListener(
-    event: VideoNodeObserverEvent,
-    listener: VideoChangeListener
-  ): void {
-    this.eventListeners.get(event)?.delete(listener)
-  }
-
   /**
    * Begin observing the DOM for video elements matching selector.
    * Waits for document.body if called at document_start in an iframe.
@@ -109,19 +111,21 @@ export class VideoNodeObserverService {
 
     const body = await waitForBody()
 
-    const [existing, err] = tryCatchSync(() =>
-      document.querySelectorAll<HTMLVideoElement>(this.selector)
-    )
+    this.listenForShadowRoots(document)
+
+    const [, err] = tryCatchSync(() => this.scan(document))
     if (err) {
       throw new Error(`Error selecting video element: ${err.message}`)
     }
-    existing?.forEach((v) => this.handleAdded(v))
 
     this.observeRoot(body)
   }
 
   stop(): void {
+    this.shadowListeners.abort()
+    this.shadowListeners = new AbortController()
     this.rootObs.disconnect()
+    this.observedShadowRoots = new WeakSet()
     this.srcObs.cleanup()
     this.eventListeners.clear()
     if (this.state.type === 'removing') clearTimeout(this.state.timerId)
@@ -133,7 +137,58 @@ export class VideoNodeObserverService {
     this.rootObs.observe(root, { childList: true, subtree: true })
   }
 
+  private scan(scope: Element | Document | ShadowRoot): void {
+    const { matches, shadowRoots } = queryAllDeep<HTMLVideoElement>(
+      scope,
+      this.selector,
+      isExtensionRoot
+    )
+    for (const root of shadowRoots) {
+      this.observeShadowRoot(root)
+    }
+    for (const video of matches) {
+      if (isVideoElement(video)) {
+        this.handleAdded(video)
+      }
+    }
+  }
+
+  private observeShadowRoot(root: ShadowRoot): void {
+    if (this.observedShadowRoots.has(root)) {
+      return
+    }
+    this.observedShadowRoots.add(root)
+    this.observeRoot(root)
+    this.listenForShadowRoots(root)
+  }
+
+  private listenForShadowRoots(target: Document | ShadowRoot): void {
+    target.addEventListener(
+      SHADOW_ROOT_ATTACHED_EVENT,
+      this.handleShadowRootAttached,
+      { capture: true, signal: this.shadowListeners.signal }
+    )
+  }
+
+  private handleShadowRootAttached = (event: Event): void => {
+    const host = event.target
+    if (!(host instanceof Node) || !isElement(host) || isExtensionRoot(host)) {
+      return
+    }
+    const root = shadowRootOf(host)
+    if (!root || this.observedShadowRoots.has(root)) {
+      return
+    }
+    this.observeShadowRoot(root)
+    this.scan(root)
+  }
+
+  // A shadow root stays observed after its host leaves the page, so mutations
+  // inside a detached player still arrive here.
   private handleAdded(video: HTMLVideoElement): void {
+    if (!video.isConnected) {
+      return
+    }
     if (!this.stack.add(video, () => this.updateActive())) {
       return
     }
