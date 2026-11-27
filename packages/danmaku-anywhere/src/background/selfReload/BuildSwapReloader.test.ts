@@ -9,8 +9,9 @@ import { BuildSwapReloader } from './BuildSwapReloader'
 /**
  * An unpacked build that Danmaku Builds swapped out from under the extension
  * reloads itself. Covers that only development installs start the check, that
- * a changed build.json tag triggers chrome.runtime.reload, and that an
- * unchanged or missing marker leaves the extension alone.
+ * a changed build.json tag triggers chrome.runtime.reload, that an unchanged
+ * or missing marker leaves the extension alone, and that the reload waits
+ * while any tab is playing a video.
  */
 
 let markerTag: string | undefined
@@ -31,6 +32,28 @@ function createReloader() {
   ).get(BuildSwapReloader)
 }
 
+// Each open tab is one frame, and the injected function runs against the
+// test document, so a tab "plays" when its turn finds a playing video there.
+function openTabs(...playing: boolean[]) {
+  fakeBrowser.tabs.query = vi.fn(async () => {
+    return playing.map((_, id) => ({ id }) as chrome.tabs.Tab)
+  })
+  fakeBrowser.scripting.executeScript = vi.fn(async (injection) => {
+    document.body.innerHTML = ''
+    if (playing[injection.target.tabId]) {
+      addVideo(document.body, true)
+    }
+    return [{ frameId: 0, documentId: '', result: injection.func() }]
+  }) as typeof fakeBrowser.scripting.executeScript
+}
+
+function addVideo(parent: ParentNode, playing: boolean) {
+  const video = document.createElement('video')
+  Object.defineProperty(video, 'paused', { value: !playing })
+  parent.append(video)
+  return video
+}
+
 async function startReloader() {
   const reloader = createReloader()
   reloader.setup()
@@ -48,9 +71,11 @@ async function fireCheck() {
 }
 
 beforeEach(() => {
+  fakeBrowser.reset()
   markerTag = undefined
   reload.mockClear()
   fakeBrowser.runtime.reload = reload
+  openTabs()
   vi.stubGlobal(
     'fetch',
     vi.fn(async () => {
@@ -112,6 +137,74 @@ describe('BuildSwapReloader', () => {
 
     markerTag = 'v1'
     await fireCheck()
+    expect(reload).toHaveBeenCalledTimes(1)
+  })
+
+  it('waits until no tab is playing a video', async () => {
+    setInstallType('development')
+    markerTag = 'v1'
+    await startReloader()
+
+    markerTag = 'v2'
+    openTabs(false, true)
+    await fireCheck()
+    expect(reload).not.toHaveBeenCalled()
+
+    openTabs(false, false)
+    await fireCheck()
+    expect(reload).toHaveBeenCalledTimes(1)
+  })
+
+  it('finds a playing video inside a shadow root', async () => {
+    setInstallType('development')
+    markerTag = 'v1'
+    await startReloader()
+
+    markerTag = 'v2'
+    openTabs(false)
+    fakeBrowser.scripting.executeScript = vi.fn(async (injection) => {
+      document.body.innerHTML = ''
+      const host = document.createElement('div')
+      document.body.append(host)
+      addVideo(host.attachShadow({ mode: 'open' }), true)
+      return [{ frameId: 0, documentId: '', result: injection.func() }]
+    }) as typeof fakeBrowser.scripting.executeScript
+    await fireCheck()
+    expect(reload).not.toHaveBeenCalled()
+  })
+
+  it('treats a tab it cannot script as not playing', async () => {
+    setInstallType('development')
+    markerTag = 'v1'
+    await startReloader()
+
+    markerTag = 'v2'
+    openTabs(true)
+    fakeBrowser.scripting.executeScript = vi.fn(async () => {
+      throw new Error('Cannot access a chrome:// URL')
+    })
+    await fireCheck()
+    expect(reload).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops waiting on a tab that never answers', async () => {
+    setInstallType('development')
+    markerTag = 'v1'
+    await startReloader()
+
+    markerTag = 'v2'
+    openTabs(true)
+    fakeBrowser.scripting.executeScript = vi.fn(
+      () => new Promise<chrome.scripting.InjectionResult[]>(() => {})
+    ) as typeof fakeBrowser.scripting.executeScript
+    vi.useFakeTimers()
+    try {
+      const check = fireCheck()
+      await vi.advanceTimersByTimeAsync(2000)
+      await check
+    } finally {
+      vi.useRealTimers()
+    }
     expect(reload).toHaveBeenCalledTimes(1)
   })
 })

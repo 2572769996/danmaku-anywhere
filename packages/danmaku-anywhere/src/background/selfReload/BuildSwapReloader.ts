@@ -2,6 +2,7 @@ import { inject, injectable } from 'inversify'
 import { alarmKeys } from '@/common/alarms/constants'
 import { type ILogger, LoggerSymbol } from '@/common/Logger'
 import { ExtStorageService } from '@/common/storage/ExtStorageService'
+import { isAnyVideoPlaying } from './isAnyVideoPlaying'
 
 // Danmaku Builds writes this into the folder it swaps builds into.
 const MARKER_FILE = 'build.json'
@@ -78,9 +79,13 @@ export class BuildSwapReloader {
       return
     }
     const tag = await readMarkerTag()
-    if (tag !== null && tag !== loaded.tag) {
-      this.logger.info(`Build changed from ${loaded.tag} to ${tag}, reloading`)
-      chrome.runtime.reload()
+    if (tag === null || tag === loaded.tag) {
+      return
     }
+    if (await isAnyVideoPlaying()) {
+      return
+    }
+    this.logger.info(`Build changed from ${loaded.tag} to ${tag}, reloading`)
+    chrome.runtime.reload()
   }
 }
